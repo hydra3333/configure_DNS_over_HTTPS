@@ -1,7 +1,9 @@
 <#
     configure_DNS_over_HTTPS.ps1
 
-    Complete DNS over HTTPS Configuration Script (Safe Mode Always On)
+    Complete DNS over HTTPS Configuration Script
+
+    (updated for powershell 5.1 compatibility)
 
     WHAT THIS DOES
     --------------
@@ -67,30 +69,33 @@
       -WindowsDoH Disable
 #>
 
-# ------------------------------------------------------------------------
-# Enums (tri-state + Windows policy)
-# ------------------------------------------------------------------------
-enum TriState    { Unchanged; Enable; Disable }
-enum WinDohPolicy { Unchanged; Off; Allow; Require }
-
-# ------------------------------------------------------------------------
-# Parameters
-# ------------------------------------------------------------------------
 [CmdletBinding()]
 param(
     # Optional: only used if -ApplyAdapterDNS is specified
     [ipaddress]$PrimaryDNS    = $null,
     [ipaddress]$SecondaryDNS  = $null,
 
-    [TriState]$WindowsDoH     = [TriState]::Unchanged,
-    [WinDohPolicy]$WindowsPolicy = [WinDohPolicy]::Unchanged,
+    [ValidateSet('Unchanged','Enable','Disable')][string]$WindowsDoH     = 'Unchanged',
+    [ValidateSet('Unchanged','Off','Allow','Require')][string]$WindowsPolicy = 'Unchanged',
 
-    [TriState]$ChromeDoH      = [TriState]::Unchanged,
-    [TriState]$FirefoxDoH     = [TriState]::Unchanged,
+    [ValidateSet('Unchanged','Enable','Disable')][string]$ChromeDoH      = 'Unchanged',
+    [ValidateSet('Unchanged','Enable','Disable')][string]$FirefoxDoH     = 'Unchanged',
 
     # Explicitly apply adapter IPv4 DNS to the system (independent of DoH policy)
     [switch]$ApplyAdapterDNS
 )
+
+# ------------------------------------------------------------------------
+# Enums (tri-state + Windows policy)
+# ------------------------------------------------------------------------
+enum TriState    { Unchanged; Enable; Disable }
+enum WinDohPolicy { Unchanged; Off; Allow; Require }
+
+# Cast incoming string parameters to enums for internal use
+$WindowsDoH   = [TriState]::$WindowsDoH
+$WindowsPolicy= [WinDohPolicy]::$WindowsPolicy
+$ChromeDoH    = [TriState]::$ChromeDoH
+$FirefoxDoH   = [TriState]::$FirefoxDoH
 
 # ------------------------------------------------------------------------
 # Globals / Helpers
@@ -206,7 +211,7 @@ function New-DnsQueryBytes {
         [ValidateSet('A','AAAA','NS','CNAME','MX','TXT')] [string]$QType = 'A'
     )
     # Header: 12 bytes
-    $rand = [System.Random]::new().Next(0,0xFFFF)
+    $rand = (New-Object System.Random).Next(0,0xFFFF)
     $idHi = ($rand -band 0xFF00) -shr 8
     $idLo =  $rand -band 0x00FF
     # Flags: 0x0100 (standard query, RD=1)
@@ -286,7 +291,8 @@ function Test-DohTemplate {
         # 2) GET fallback: ?dns=<base64url(dns-message)>
         $b64 = [Convert]::ToBase64String($q)
         $b64url = $b64.TrimEnd('=').Replace('+','-').Replace('/','_')
-        $sep = ($TemplateUrl.Contains('?')) ? '&' : '?'
+        $sep = '?'
+        if ($TemplateUrl.Contains('?')) { $sep = '&' }
         $url = "$TemplateUrl$sep" + "dns=$b64url"
 
         $req = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, $url)
