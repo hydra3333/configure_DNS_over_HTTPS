@@ -348,13 +348,18 @@ function Register-DohTemplate {
             Add-DnsClientDohServerAddress -ServerAddress $ServerIP -DohTemplate $Template -AutoUpgrade:$true -AllowFallbackToUdp:$true -ErrorAction Stop
             Write-OK ("  Registered DoH template: {0} -> {1}" -f $ServerIP, $Template)
         } catch {
-            Write-Warn ("  Cmdlet registration failed ({0}); trying netsh..." -f $_.Exception.Message)
-            & netsh dns add encryption server=$ServerIP dohtemplate=$Template autoupgrade=yes udpfallback=yes | Out-Null
-            Write-OK ("  Registered via netsh: {0} -> {1}" -f $ServerIP, $Template)
+            Write-Warn ("  Cmdlet for DoH template registration failed ({0}); trying netsh..." -f $_.Exception.Message)
+            $args = @('dns','add','encryption', "server=$ServerIP", "dohtemplate=$Template", 'autoupgrade=yes', 'udpfallback=yes')
+            & netsh @args | Out-Null
+            if ($LASTEXITCODE -ne 0) {throw "netsh failed with exit code $LASTEXITCODE for $ServerIP -> $Template" }
+            Write-OK ("  Registered DoH template via netsh: {0} -> {1}" -f $ServerIP, $Template)
         }
     } else {
-        & netsh dns add encryption server=$ServerIP dohtemplate=$Template autoupgrade=yes udpfallback=yes | Out-Null
-        Write-OK ("  Registered via netsh: {0} -> {1}" -f $ServerIP, $Template)
+        # Build args array for netsh call (PowerShell-safe quoting)
+        $args = @('dns','add','encryption', "server=$ServerIP", "dohtemplate=$Template", 'autoupgrade=yes', 'udpfallback=yes')
+        & netsh @args | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "netsh failed with exit code $LASTEXITCODE for $ServerIP -> $Template" }
+        Write-OK ("  Registered DoH template via netsh: {0} -> {1}" -f $ServerIP, $Template)
     }
 }
 
@@ -362,13 +367,13 @@ function Register-DohTemplate {
 # Windows: set DoH policy (Windows Registry HKLM policy path)
 # ------------------------------------------------------------------------
 function Set-WindowsDohPolicy {
-    param([WinDohPolicy]$WinDohPolicy)
+    param([WinDohPolicy]$WinPolicy)
 
     $path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient"
     if (-not (Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
 
     $v = $null
-    switch ($WinDohPolicy) {
+    switch ($WinPolicy) {
         'Off'     { $v = 0 }
         'Allow'   { $v = 1 }
         'Require' { $v = 2 }
@@ -376,7 +381,7 @@ function Set-WindowsDohPolicy {
     }
 
     Set-ItemProperty -Path $path -Name "DoHPolicy" -Type DWord -Value $v
-    Write-OK ("Windows DNS DoH policy set to {0} ({1})" -f $WinDohPolicy, $v)
+    Write-OK ("Windows DNS DoH policy set to {0} ({1})" -f $WinPolicy, $v)
 }
 
 # ------------------------------------------------------------------------
@@ -580,12 +585,12 @@ try {
             # 4) Apply policy: Off / Allow / Require (with two-phase for Require)
             switch ($requestedPolicy) {
                 'Off' {
-                    Set-WindowsDohPolicy -Policy ([WinDohPolicy]::Off)
+                    Set-WindowsDohPolicy -WinPolicy ([WinDohPolicy]::Off)
                 }
                 'Allow' {
                     # We prefer to have at least one plain DNS OK, but still apply Allow even if plaintext is down,
                     # since DoH may still succeed.
-                    Set-WindowsDohPolicy -Policy ([WinDohPolicy]::Allow)
+                    Set-WindowsDohPolicy -WinPolicy ([WinDohPolicy]::Allow)
                     # Flush DNS to apply quickly
                     Write-Info "Flushing DNS cache..."
                     ipconfig /flushdns | Out-Null
@@ -602,10 +607,10 @@ try {
                 'Require' {
                     if (-not $canRequire) {
                         Write-Err "Blocking Require due to failing preflight checks. Applying Allow for safety."
-                        Set-WindowsDohPolicy -Policy ([WinDohPolicy]::Allow)
+                        Set-WindowsDohPolicy -WinPolicy ([WinDohPolicy]::Allow)
                     } else {
                         # Phase 1: Allow
-                        Set-WindowsDohPolicy -Policy ([WinDohPolicy]::Allow)
+                        Set-WindowsDohPolicy -WinPolicy ([WinDohPolicy]::Allow)
                         Write-Info "Flushing DNS cache..."
                         ipconfig /flushdns | Out-Null
                         Write-OK "DNS cache flushed."
@@ -622,7 +627,7 @@ try {
 
                         # Phase 2: Promote to Require if Allow succeeded
                         if ($allowOK) {
-                            Set-WindowsDohPolicy -Policy ([WinDohPolicy]::Require)
+                            Set-WindowsDohPolicy -WinPolicy ([WinDohPolicy]::Require)
                             Write-OK "Promoted to Require."
                         } else {
                             Write-Warn "Staying on Allow due to failed test."
@@ -631,7 +636,7 @@ try {
                 }
                 default {
                     Write-Warn "WindowsDoH=Enable but WindowsPolicy=Unchanged; applied Allow as a safe default."
-                    Set-WindowsDohPolicy -Policy ([WinDohPolicy]::Allow)
+                    Set-WindowsDohPolicy -WinPolicy ([WinDohPolicy]::Allow)
                 }
             }
         }
