@@ -223,33 +223,102 @@ function Test-DohTemplate {
     )
     if (-not $TemplateUrl) { return $false }
 
-    $q = New-DnsQueryBytes -Name $ProbeName -QType 'A'
+    # Verbose diagnostics just for this function
+    $debugProbe = $true
+    function Dbg($msg) { if ($debugProbe) { Write-Info ("[DoH probe] {0}" -f $msg) } }
 
-    $handler = New-Object System.Net.Http.HttpClientHandler
-    $handler.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
-    $client = New-Object System.Net.Http.HttpClient($handler)
-    $client.Timeout = [TimeSpan]::FromSeconds(7)
-
-    function Test-DnsResponseHeader([byte[]]$resp) {
-        if (-not $resp -or $resp.Length -lt 12) { return $false }
-        $flags = ($resp[2] -shl 8) -bor $resp[3]
-        $isResponse = ($flags -band 0x8000) -ne 0
-        return $isResponse
+    # Helpers for diagnostics
+    function Hex-Preview([byte[]]$bytes, [int]$max=32) {
+        if (-not $bytes) { return "(null)" }
+        $len = [Math]::Min($bytes.Length, $max)
+        $sb = New-Object System.Text.StringBuilder
+        for ($i=0; $i -lt $len; $i++) { [void]$sb.AppendFormat("{0:X2} ", $bytes[$i]) }
+        if ($bytes.Length -gt $max) { [void]$sb.Append("...") }
+        return $sb.ToString().Trim()
+    }
+    function Parse-DnsHeader([byte[]]$resp) {
+        if (-not $resp -or $resp.Length -lt 12) { return @{ ok=$false; reason="Too short (<12 bytes)" } }
+        $id     = ($resp[0] -shl 8) -bor $resp[1]
+        $flags  = ($resp[2] -shl 8) -bor $resp[3]
+        $qr     = (($flags -band 0x8000) -ne 0)
+        $opcode = (($flags -band 0x7800) -shr 11)
+        $aa     = (($flags -band 0x0400) -ne 0)
+        $tc     = (($flags -band 0x0200) -ne 0)
+        $rd     = (($flags -band 0x0100) -ne 0)
+        $ra     = (($flags -band 0x0080) -ne 0)
+        $rcode  = ($flags -band 0x000F)
+        return @{
+            ok     = $qr
+            id     = $id
+            flags  = $flags
+            opcode = $opcode
+            aa     = $aa
+            tc     = $tc
+            rd     = $rd
+            ra     = $ra
+            rcode  = $rcode
+        }
     }
 
+    # Prepare query bytes
+    $q = New-DnsQueryBytes -Name $ProbeName -QType 'A'
+    Dbg ("Template: {0} | Name: {1}" -f $TemplateUrl, $ProbeName)
+
+    # TLS policy: prefer OS defaults (TLS 1.3 allowed); fallback add TLS 1.2 and retry once; restore at exit.
+    $spmOriginal = $null
+    $spmTweaked  = $false
     try {
-        $content = New-Object System.Net.Http.ByteArrayContent($q)
+        $spmOriginal = [System.Net.ServicePointManager]::SecurityProtocol
+        $hasSystemDefault = [enum]::IsDefined([System.Net.SecurityProtocolType], 'SystemDefault')
+        Dbg ("SecurityProtocol original flags: {0}" -f $spmOriginal)
+        if ($hasSystemDefault) {
+            [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::SystemDefault
+            $spmTweaked = $true
+            Dbg ("SecurityProtocol set to SystemDefault")
+        } else {
+            Dbg ("SystemDefault not available on this runtime; using current SecurityProtocol")
+        }
+    } catch {
+        Dbg ("Could not read/set SecurityProtocol: {0}" -f $_.Exception.Message)
+    }
+    function Restore-TlsSetting {
+        if ($spmTweaked -and $spmOriginal -ne $null) {
+            try { [System.Net.ServicePointManager]::SecurityProtocol = $spmOriginal; Dbg ("SecurityProtocol restored to original: {0}" -f $spmOriginal) } catch { Dbg ("Failed to restore SecurityProtocol: {0}" -f $_.Exception.Message) }
+        }
+    }
+
+    function New-DohHttpClient {
+        $h = New-Object System.Net.Http.HttpClientHandler
+        $h.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
+        $c = New-Object System.Net.Http.HttpClient($h)
+        $c.Timeout = [TimeSpan]::FromSeconds(7)
+        return $c
+    }
+    $client = New-DohHttpClient
+
+    # ---------- First pass (OS-default TLS) ----------
+    try {
+        Dbg "POST attempt (first pass)"
+        $content = New-Object System.Net.Http.ByteArrayContent -ArgumentList (,[byte[]]$q)  # <<< fix: pass as single arg
         $content.Headers.ContentType = 'application/dns-message'
         $content.Headers.Add('Accept','application/dns-message')
 
         $resp = $client.PostAsync($TemplateUrl, $content).GetAwaiter().GetResult()
+        $ct = $null; try { if ($resp.Content -and $resp.Content.Headers -and $resp.Content.Headers.ContentType) { $ct = $resp.Content.Headers.ContentType.MediaType } } catch {}
+        Dbg ("POST status: {0} {1} | Content-Type: {2}" -f ([int]$resp.StatusCode), $resp.ReasonPhrase, ($(if ($ct) { $ct } else { '(none)' })))
         if ($resp.IsSuccessStatusCode) {
             $bytes = $resp.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult()
-            if (Test-DnsResponseHeader $bytes) { return $true }
+            Dbg ("POST content length: {0} | Hex preview: {1}" -f ($bytes.Length), (Hex-Preview $bytes 24))
+            $hdr = Parse-DnsHeader $bytes
+            if ($hdr.ok) { Dbg ("POST DNS header OK | ID=0x{0:X4} Flags=0x{1:X4} OPCODE={2} RCODE={3}" -f $hdr.id, $hdr.flags, $hdr.opcode, $hdr.rcode); Restore-TlsSetting; return $true }
+            else { Dbg ("POST body not valid DNS message: {0}" -f $hdr.reason) }
         }
-    } catch { }
+    } catch {
+        Dbg ("POST threw: {0}" -f $_.Exception.Message)
+    }
 
     try {
+        Dbg "GET attempt (first pass)"
         $b64 = [Convert]::ToBase64String($q)
         $b64url = $b64.TrimEnd('=').Replace('+','-').Replace('/','_')
         $sep = '?'
@@ -259,12 +328,94 @@ function Test-DohTemplate {
         $req = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, $url)
         $req.Headers.Add('Accept','application/dns-message')
         $resp2 = $client.SendAsync($req).GetAwaiter().GetResult()
+        $ct2 = $null; try { if ($resp2.Content -and $resp2.Content.Headers -and $resp2.Content.Headers.ContentType) { $ct2 = $resp2.Content.Headers.ContentType.MediaType } } catch {}
+        Dbg ("GET status: {0} {1} | Content-Type: {2}" -f ([int]$resp2.StatusCode), $resp2.ReasonPhrase, ($(if ($ct2) { $ct2 } else { '(none)' })))
         if ($resp2.IsSuccessStatusCode) {
             $bytes2 = $resp2.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult()
-            if (Test-DnsResponseHeader $bytes2) { return $true }
+            Dbg ("GET content length: {0} | Hex preview: {1}" -f ($bytes2.Length), (Hex-Preview $bytes2 24))
+            $hdr2 = Parse-DnsHeader $bytes2
+            if ($hdr2.ok) { Dbg ("GET DNS header OK | ID=0x{0:X4} Flags=0x{1:X4} OPCODE={2} RCODE={3}" -f $hdr2.id, $hdr2.flags, $hdr2.opcode, $hdr2.rcode); Restore-TlsSetting; return $true }
+            else {
+                # If not DNS, try to print a short text preview to diagnose proxies/pages
+                try { 
+                    $text = [System.Text.Encoding]::UTF8.GetString($bytes2, 0, [Math]::Min($bytes2.Length, 200))
+                    Dbg ("GET HTTP OK but DNS header invalid | Text preview: {0}" -f ($text -replace '\s+',' ')) 
+                } catch { Dbg "GET response could not be decoded as UTF8" }
+            }
         }
-    } catch { }
+    } catch {
+        Dbg ("GET threw: {0}" -f $_.Exception.Message)
+    }
 
+    # ---------- Fallback pass (ensure TLS 1.2 bit is enabled) ----------
+    $didAddTls12 = $false
+    try {
+        $cur = [System.Net.ServicePointManager]::SecurityProtocol
+        if (($cur -band [System.Net.SecurityProtocolType]::Tls12) -eq 0) {
+            [System.Net.ServicePointManager]::SecurityProtocol = $cur -bor [System.Net.SecurityProtocolType]::Tls12
+            $didAddTls12 = $true
+            $spmTweaked = $true
+            Dbg ("Added TLS 1.2 to SecurityProtocol. New flags: {0}" -f [System.Net.ServicePointManager]::SecurityProtocol)
+            $client.Dispose()
+            $client = New-DohHttpClient
+        } else {
+            Dbg "TLS 1.2 already allowed; skipping fallback add"
+        }
+    } catch {
+        Dbg ("Could not adjust SecurityProtocol for TLS 1.2: {0}" -f $_.Exception.Message)
+    }
+
+    if ($didAddTls12) {
+        try {
+            Dbg "POST attempt (fallback with TLS 1.2)"
+            $content2 = New-Object System.Net.Http.ByteArrayContent -ArgumentList (,[byte[]]$q)  # <<< fix here too
+            $content2.Headers.ContentType = 'application/dns-message'
+            $content2.Headers.Add('Accept','application/dns-message')
+
+            $r3 = $client.PostAsync($TemplateUrl, $content2).GetAwaiter().GetResult()
+            $ct3 = $null; try { if ($r3.Content -and $r3.Content.Headers -and $r3.Content.Headers.ContentType) { $ct3 = $r3.Content.Headers.ContentType.MediaType } } catch {}
+            Dbg ("POST status: {0} {1} | Content-Type: {2}" -f ([int]$r3.StatusCode), $r3.ReasonPhrase, ($(if ($ct3) { $ct3 } else { '(none)' })))
+            if ($r3.IsSuccessStatusCode) {
+                $b3 = $r3.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult()
+                Dbg ("POST content length: {0} | Hex preview: {1}" -f ($b3.Length), (Hex-Preview $b3 24))
+                $hdr3 = Parse-DnsHeader $b3
+                if ($hdr3.ok) { Dbg ("POST DNS header OK (fallback) | ID=0x{0:X4} Flags=0x{1:X4} OPCODE={2} RCODE={3}" -f $hdr3.id, $hdr3.flags, $hdr3.opcode, $hdr3.rcode); Restore-TlsSetting; return $true }
+                else { Dbg ("POST HTTP OK but DNS header invalid (fallback): {0}" -f $hdr3.reason) }
+            }
+        } catch {
+            Dbg ("POST (fallback) threw: {0}" -f $_.Exception.Message)
+        }
+        try {
+            Dbg "GET attempt (fallback with TLS 1.2)"
+            $b64 = [Convert]::ToBase64String($q)
+            $b64url = $b64.TrimEnd('=').Replace('+','-').Replace('/','_')
+            $sep = '?'
+            if ($TemplateUrl.Contains('?')) { $sep = '&' }
+            $url = "$TemplateUrl$sep" + "dns=$b64url"
+            $req3 = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, $url)
+            $req3.Headers.Add('Accept','application/dns-message')
+            $r4 = $client.SendAsync($req3).GetAwaiter().GetResult()
+            $ct4 = $null; try { if ($r4.Content -and $r4.Content.Headers -and $r4.Content.Headers.ContentType) { $ct4 = $r4.Content.Headers.ContentType.MediaType } } catch {}
+            Dbg ("GET status: {0} {1} | Content-Type: {2}" -f ([int]$r4.StatusCode), $r4.ReasonPhrase, ($(if ($ct4) { $ct4 } else { '(none)' })))
+            if ($r4.IsSuccessStatusCode) {
+                $b4 = $r4.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult()
+                Dbg ("GET content length: {0} | Hex preview: {1}" -f ($b4.Length), (Hex-Preview $b4 24))
+                $hdr4 = Parse-DnsHeader $b4
+                if ($hdr4.ok) { Dbg ("GET DNS header OK (fallback) | ID=0x{0:X4} Flags=0x{1:X4} OPCODE={2} RCODE={3}" -f $hdr4.id, $hdr4.flags, $hdr4.opcode, $hdr4.rcode); Restore-TlsSetting; return $true }
+                else {
+                    try { 
+                        $text2 = [System.Text.Encoding]::UTF8.GetString($b4, 0, [Math]::Min($b4.Length, 200))
+                        Dbg ("GET HTTP OK but DNS header invalid (fallback) | Text preview: {0}" -f ($text2 -replace '\s+',' '))
+                    } catch { Dbg "GET response (fallback) could not be decoded as UTF8" }
+                }
+            }
+        } catch {
+            Dbg ("GET (fallback) threw: {0}" -f $_.Exception.Message)
+        }
+    }
+
+    Dbg "All attempts failed"
+    Restore-TlsSetting
     return $false
 }
 
