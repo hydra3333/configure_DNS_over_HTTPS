@@ -11,7 +11,7 @@ A PowerShell script to (re)configure DNS-over-HTTPS (DoH) and DNS server IPs for
 It’s intentionally **careful and test-first**: it checks reachability and does a real DoH probe before enforcing stricter settings, to help avoid breaking name resolution.
 You can also optionally change the Windows adapter’s DNS IPs — just remember any **original** IPs if you plan to revert to later.
 
-> **Supported resolvers:** only a subset are recognized out of the box (see the IP -> DoH template map in the script). You can extend that map as you verify more providers.
+> **Supported DNS DoH resolvers:** only a subset are recognized out of the box (see the IP -> DoH template map in the script). You can extend that map as you verify more providers.
 
 ---
 
