@@ -97,6 +97,14 @@ $WindowsPolicy= [WinDohPolicy]::$WindowsPolicy
 $ChromeDoH    = [TriState]::$ChromeDoH
 $FirefoxDoH   = [TriState]::$FirefoxDoH
 
+
+
+# ------------------------------------------------------------------------
+# Parameters
+# ------------------------------------------------------------------------
+[switch]$ApplyAdapterDNS
+)
+
 # ------------------------------------------------------------------------
 # Globals / Helpers
 # ------------------------------------------------------------------------
@@ -194,9 +202,9 @@ function Get-DohHost {
 }
 
 function Test-Tcp443 {
-    param([string]$Host)
+    param([string]$dohHost)
     try {
-        $r = Test-NetConnection -ComputerName $Host -Port 443 -InformationLevel Quiet
+        $r = Test-NetConnection -ComputerName $dohHost -Port 443 -InformationLevel Quiet
         return [bool]$r
     } catch { return $false }
 }
@@ -316,7 +324,9 @@ function Set-AdapterDnsIPv4 {
     param([ipaddress]$Dns1, [ipaddress]$Dns2)
 
     Write-Info "Applying adapter IPv4 DNS servers to active interfaces..."
-    $rows = Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction Stop | Where-Object { $_.InterfaceAlias -notmatch 'Loopback|Virtual|Tunneling|isatap|TAP|VPN' } | Select-Object -Unique InterfaceAlias, InterfaceIndex
+    $rows = Get-DnsClient -AddressFamily IPv4 -ErrorAction Stop | Where-Object {
+        $_.InterfaceAlias -notmatch 'Loopback|Virtual|Tunneling|isatap|TAP|VPN'
+    }
 
     if (-not $rows -or $rows.Count -eq 0) {
         Write-Warn "  No suitable IPv4 DNS client interfaces found."
@@ -577,7 +587,7 @@ try {
                 } else {
                     foreach ($tpl in $templatesForWindows) {
                         $dohHost = Get-DohHost -Template $tpl
-                        $h443 = Test-Tcp443 -Host $host
+                        $h443 = Test-Tcp443 -Host $dohHost
                         Write-Info ("  443 to {0}: {1}" -f $dohHost, ($(if ($h443) { 'OK' } else { 'Fail' })))
                         if (-not $h443) { $canRequire = $false }
 
