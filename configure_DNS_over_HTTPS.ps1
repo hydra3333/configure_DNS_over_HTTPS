@@ -224,7 +224,8 @@ function Test-DohTemplate {
     if (-not $TemplateUrl) { return $false }
 
     # Verbose diagnostics just for this function
-    $debugProbe = $true
+    #$debugProbe = $true
+    $debugProbe = $false
     function Dbg($msg) { if ($debugProbe) { Write-Info ("[DoH probe] {0}" -f $msg) } }
 
     # Helpers for diagnostics
@@ -237,27 +238,15 @@ function Test-DohTemplate {
         return $sb.ToString().Trim()
     }
     function Parse-DnsHeader([byte[]]$resp) {
+        # Minimal parse + QR check; robust on PS5.1
         if (-not $resp -or $resp.Length -lt 12) { return @{ ok=$false; reason="Too short (<12 bytes)" } }
         $id     = ($resp[0] -shl 8) -bor $resp[1]
         $flags  = ($resp[2] -shl 8) -bor $resp[3]
-        $qr     = (($flags -band 0x8000) -ne 0)
+        # Simple, byte-level QR check (high bit of byte 2)
+        $qrBit  = (($resp[2] -band 0x80) -ne 0)
         $opcode = (($flags -band 0x7800) -shr 11)
-        $aa     = (($flags -band 0x0400) -ne 0)
-        $tc     = (($flags -band 0x0200) -ne 0)
-        $rd     = (($flags -band 0x0100) -ne 0)
-        $ra     = (($flags -band 0x0080) -ne 0)
         $rcode  = ($flags -band 0x000F)
-        return @{
-            ok     = $qr
-            id     = $id
-            flags  = $flags
-            opcode = $opcode
-            aa     = $aa
-            tc     = $tc
-            rd     = $rd
-            ra     = $ra
-            rcode  = $rcode
-        }
+        return @{ ok=$qrBit; id=$id; flags=$flags; opcode=$opcode; rcode=$rcode }
     }
 
     # Prepare query bytes
@@ -299,19 +288,23 @@ function Test-DohTemplate {
     # ---------- First pass (OS-default TLS) ----------
     try {
         Dbg "POST attempt (first pass)"
-        $content = New-Object System.Net.Http.ByteArrayContent -ArgumentList (,[byte[]]$q)  # <<< fix: pass as single arg
-        $content.Headers.ContentType = 'application/dns-message'
-        $content.Headers.Add('Accept','application/dns-message')
+        # Content headers belong on HttpContent; Accept belongs on the request
+        $content = New-Object System.Net.Http.ByteArrayContent -ArgumentList (,[byte[]]$q)
+        $null = $content.Headers.TryAddWithoutValidation('Content-Type','application/dns-message')
+        $reqPost = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Post, $TemplateUrl)
+        $null = $reqPost.Headers.TryAddWithoutValidation('Accept','application/dns-message')
+        $reqPost.Content = $content
 
-        $resp = $client.PostAsync($TemplateUrl, $content).GetAwaiter().GetResult()
+        $resp = $client.SendAsync($reqPost).GetAwaiter().GetResult()
         $ct = $null; try { if ($resp.Content -and $resp.Content.Headers -and $resp.Content.Headers.ContentType) { $ct = $resp.Content.Headers.ContentType.MediaType } } catch {}
         Dbg ("POST status: {0} {1} | Content-Type: {2}" -f ([int]$resp.StatusCode), $resp.ReasonPhrase, ($(if ($ct) { $ct } else { '(none)' })))
         if ($resp.IsSuccessStatusCode) {
             $bytes = $resp.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult()
             Dbg ("POST content length: {0} | Hex preview: {1}" -f ($bytes.Length), (Hex-Preview $bytes 24))
             $hdr = Parse-DnsHeader $bytes
-            if ($hdr.ok) { Dbg ("POST DNS header OK | ID=0x{0:X4} Flags=0x{1:X4} OPCODE={2} RCODE={3}" -f $hdr.id, $hdr.flags, $hdr.opcode, $hdr.rcode); Restore-TlsSetting; return $true }
-            else { Dbg ("POST body not valid DNS message: {0}" -f $hdr.reason) }
+            Dbg ("POST header parse -> ok={0} id=0x{1:X4} flags=0x{2:X4} opcode={3} rcode={4}" -f $hdr.ok, $hdr.id, $hdr.flags, $hdr.opcode, $hdr.rcode)
+            if ($hdr.ok) { Restore-TlsSetting; return $true }
+            else { Dbg "POST HTTP OK but DNS header invalid" }
         }
     } catch {
         Dbg ("POST threw: {0}" -f $_.Exception.Message)
@@ -326,7 +319,7 @@ function Test-DohTemplate {
         $url = "$TemplateUrl$sep" + "dns=$b64url"
 
         $req = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, $url)
-        $req.Headers.Add('Accept','application/dns-message')
+        $null = $req.Headers.TryAddWithoutValidation('Accept','application/dns-message')
         $resp2 = $client.SendAsync($req).GetAwaiter().GetResult()
         $ct2 = $null; try { if ($resp2.Content -and $resp2.Content.Headers -and $resp2.Content.Headers.ContentType) { $ct2 = $resp2.Content.Headers.ContentType.MediaType } } catch {}
         Dbg ("GET status: {0} {1} | Content-Type: {2}" -f ([int]$resp2.StatusCode), $resp2.ReasonPhrase, ($(if ($ct2) { $ct2 } else { '(none)' })))
@@ -334,12 +327,12 @@ function Test-DohTemplate {
             $bytes2 = $resp2.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult()
             Dbg ("GET content length: {0} | Hex preview: {1}" -f ($bytes2.Length), (Hex-Preview $bytes2 24))
             $hdr2 = Parse-DnsHeader $bytes2
-            if ($hdr2.ok) { Dbg ("GET DNS header OK | ID=0x{0:X4} Flags=0x{1:X4} OPCODE={2} RCODE={3}" -f $hdr2.id, $hdr2.flags, $hdr2.opcode, $hdr2.rcode); Restore-TlsSetting; return $true }
+            Dbg ("GET header parse -> ok={0} id=0x{1:X4} flags=0x{2:X4} opcode={3} rcode={4}" -f $hdr2.ok, $hdr2.id, $hdr2.flags, $hdr2.opcode, $hdr2.rcode)
+            if ($hdr2.ok) { Restore-TlsSetting; return $true }
             else {
-                # If not DNS, try to print a short text preview to diagnose proxies/pages
-                try { 
+                try {
                     $text = [System.Text.Encoding]::UTF8.GetString($bytes2, 0, [Math]::Min($bytes2.Length, 200))
-                    Dbg ("GET HTTP OK but DNS header invalid | Text preview: {0}" -f ($text -replace '\s+',' ')) 
+                    Dbg ("GET HTTP OK but DNS header invalid | Text preview: {0}" -f ($text -replace '\s+',' '))
                 } catch { Dbg "GET response could not be decoded as UTF8" }
             }
         }
@@ -368,19 +361,22 @@ function Test-DohTemplate {
     if ($didAddTls12) {
         try {
             Dbg "POST attempt (fallback with TLS 1.2)"
-            $content2 = New-Object System.Net.Http.ByteArrayContent -ArgumentList (,[byte[]]$q)  # <<< fix here too
-            $content2.Headers.ContentType = 'application/dns-message'
-            $content2.Headers.Add('Accept','application/dns-message')
+            $content2 = New-Object System.Net.Http.ByteArrayContent -ArgumentList (,[byte[]]$q)
+            $null = $content2.Headers.TryAddWithoutValidation('Content-Type','application/dns-message')
+            $reqPost2 = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Post, $TemplateUrl)
+            $null = $reqPost2.Headers.TryAddWithoutValidation('Accept','application/dns-message')
+            $reqPost2.Content = $content2
 
-            $r3 = $client.PostAsync($TemplateUrl, $content2).GetAwaiter().GetResult()
+            $r3 = $client.SendAsync($reqPost2).GetAwaiter().GetResult()
             $ct3 = $null; try { if ($r3.Content -and $r3.Content.Headers -and $r3.Content.Headers.ContentType) { $ct3 = $r3.Content.Headers.ContentType.MediaType } } catch {}
             Dbg ("POST status: {0} {1} | Content-Type: {2}" -f ([int]$r3.StatusCode), $r3.ReasonPhrase, ($(if ($ct3) { $ct3 } else { '(none)' })))
             if ($r3.IsSuccessStatusCode) {
                 $b3 = $r3.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult()
                 Dbg ("POST content length: {0} | Hex preview: {1}" -f ($b3.Length), (Hex-Preview $b3 24))
                 $hdr3 = Parse-DnsHeader $b3
-                if ($hdr3.ok) { Dbg ("POST DNS header OK (fallback) | ID=0x{0:X4} Flags=0x{1:X4} OPCODE={2} RCODE={3}" -f $hdr3.id, $hdr3.flags, $hdr3.opcode, $hdr3.rcode); Restore-TlsSetting; return $true }
-                else { Dbg ("POST HTTP OK but DNS header invalid (fallback): {0}" -f $hdr3.reason) }
+                Dbg ("POST header parse (fallback) -> ok={0} id=0x{1:X4} flags=0x{2:X4} opcode={3} rcode={4}" -f $hdr3.ok, $hdr3.id, $hdr3.flags, $hdr3.opcode, $hdr3.rcode)
+                if ($hdr3.ok) { Restore-TlsSetting; return $true }
+                else { Dbg ("POST HTTP OK but DNS header invalid (fallback)") }
             }
         } catch {
             Dbg ("POST (fallback) threw: {0}" -f $_.Exception.Message)
@@ -393,7 +389,7 @@ function Test-DohTemplate {
             if ($TemplateUrl.Contains('?')) { $sep = '&' }
             $url = "$TemplateUrl$sep" + "dns=$b64url"
             $req3 = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, $url)
-            $req3.Headers.Add('Accept','application/dns-message')
+            $null = $req3.Headers.TryAddWithoutValidation('Accept','application/dns-message')
             $r4 = $client.SendAsync($req3).GetAwaiter().GetResult()
             $ct4 = $null; try { if ($r4.Content -and $r4.Content.Headers -and $r4.Content.Headers.ContentType) { $ct4 = $r4.Content.Headers.ContentType.MediaType } } catch {}
             Dbg ("GET status: {0} {1} | Content-Type: {2}" -f ([int]$r4.StatusCode), $r4.ReasonPhrase, ($(if ($ct4) { $ct4 } else { '(none)' })))
@@ -401,9 +397,10 @@ function Test-DohTemplate {
                 $b4 = $r4.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult()
                 Dbg ("GET content length: {0} | Hex preview: {1}" -f ($b4.Length), (Hex-Preview $b4 24))
                 $hdr4 = Parse-DnsHeader $b4
-                if ($hdr4.ok) { Dbg ("GET DNS header OK (fallback) | ID=0x{0:X4} Flags=0x{1:X4} OPCODE={2} RCODE={3}" -f $hdr4.id, $hdr4.flags, $hdr4.opcode, $hdr4.rcode); Restore-TlsSetting; return $true }
+                Dbg ("GET header parse (fallback) -> ok={0} id=0x{1:X4} flags=0x{2:X4} opcode={3} rcode={4}" -f $hdr4.ok, $hdr4.id, $hdr4.flags, $hdr4.opcode, $hdr4.rcode)
+                if ($hdr4.ok) { Restore-TlsSetting; return $true }
                 else {
-                    try { 
+                    try {
                         $text2 = [System.Text.Encoding]::UTF8.GetString($b4, 0, [Math]::Min($b4.Length, 200))
                         Dbg ("GET HTTP OK but DNS header invalid (fallback) | Text preview: {0}" -f ($text2 -replace '\s+',' '))
                     } catch { Dbg "GET response (fallback) could not be decoded as UTF8" }
