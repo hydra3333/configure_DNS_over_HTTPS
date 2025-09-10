@@ -1,9 +1,7 @@
-<#
+<# 
     configure_DNS_over_HTTPS.ps1
 
-    Complete DNS over HTTPS Configuration Script
-
-    (updated for powershell 5.1 compatibility)
+    Complete DNS over HTTPS Configuration Script (Safe Mode Always On)
 
     WHAT THIS DOES
     --------------
@@ -24,6 +22,10 @@
         - Real DoH probe: send an RFC 8484 application/dns-message query and validate the response
         - Two-phase Windows policy apply (Allow -> test -> Require)
         - Block Require when template unknown or probes fail
+    - Before/After logging (Windows changes):
+        - Adapter DNS (per NIC) lists previous and resulting server IPs
+        - DoH template registrations show previous and resulting mapping
+        - Windows DoH policy prints previous and resulting values (numeric + name)
 
     IMPORTANT CONCEPTS
     ------------------
@@ -39,34 +41,6 @@
     - Safe Mode: always on (no switch to disable in this script)
     - No default DNS IPs are applied. If you want to change adapter DNS, pass:
         -ApplyAdapterDNS -PrimaryDNS <ip> -SecondaryDNS <ip>
-
-    EXAMPLES
-    --------
-    # 1) Windows DoH Enable using CURRENT adapter DNS (no change of adapter IPs):
-    #    Register templates for recognized current DNS IPs; set Allow; test; promote to Require.
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -NonInteractive -WindowStyle Hidden `
-      -File ".\configure_DNS_over_HTTPS.ps1" `
-      -WindowsDoH Enable -WindowsPolicy Require
-
-    # 2) Firefox DoH only (per-user), leave Windows unchanged:
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -NonInteractive -WindowStyle Hidden `
-      -File ".\configure_DNS_over_HTTPS.ps1" `
-      -FirefoxDoH Enable
-
-    # 3) Chrome DoH only (per-user), leave Windows unchanged:
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -NonInteractive -WindowStyle Hidden `
-      -File ".\configure_DNS_over_HTTPS.ps1" `
-      -ChromeDoH Enable
-
-    # 4) Change adapter DNS to Cloudflare + Quad9 (WITHOUT touching Windows DoH policy):
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -NonInteractive -WindowStyle Hidden `
-      -File ".\configure_DNS_over_HTTPS.ps1" `
-      -ApplyAdapterDNS -PrimaryDNS 1.1.1.1 -SecondaryDNS 9.9.9.9
-
-    # 5) Windows DoH Disable (policy Off), keep adapter DNS as-is:
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -NonInteractive -WindowStyle Hidden `
-      -File ".\configure_DNS_over_HTTPS.ps1" `
-      -WindowsDoH Disable
 #>
 
 [CmdletBinding()]
@@ -92,18 +66,10 @@ enum TriState    { Unchanged; Enable; Disable }
 enum WinDohPolicy { Unchanged; Off; Allow; Require }
 
 # Cast incoming string parameters to enums for internal use
-$WindowsDoH   = [TriState]::$WindowsDoH
-$WindowsPolicy= [WinDohPolicy]::$WindowsPolicy
-$ChromeDoH    = [TriState]::$ChromeDoH
-$FirefoxDoH   = [TriState]::$FirefoxDoH
-
-
-
-# ------------------------------------------------------------------------
-# Parameters
-# ------------------------------------------------------------------------
-[switch]$ApplyAdapterDNS
-)
+$WindowsDoH    = [TriState]::$WindowsDoH
+$WindowsPolicy = [WinDohPolicy]::$WindowsPolicy
+$ChromeDoH     = [TriState]::$ChromeDoH
+$FirefoxDoH    = [TriState]::$FirefoxDoH
 
 # ------------------------------------------------------------------------
 # Globals / Helpers
@@ -119,8 +85,7 @@ function Write-Err($text)      { Write-Host $text -ForegroundColor Red }
 
 # ------------------------------------------------------------------------
 # Known IPv4 DNS -> DoH Template mapping.
-# Add to this as you verify providers. If a template is unknown, we can still run with Allow,
-# ... but Require will be blocked from being implemented so as to avoid breaking DNS on the PC.
+# Add to this as you verify providers.
 $dnsToDohMap = @{
     # Aussie Broadband (ABB)
     '202.142.142.142' = 'https://dnscache1.aussiebroadband.com.au/dns-query'
@@ -185,8 +150,7 @@ function Test-PlainDnsTcp {
     param([string]$ServerIP)
 
     try {
-        # Use a real DNS query over TCP (skip UDP since it may be blocked).
-        $res = Resolve-DnsName -Server $ServerIP -TcpOnly -DnsOnly -Type A -Name "example.com" -ErrorAction Stop
+        $null = Resolve-DnsName -Server $ServerIP -TcpOnly -DnsOnly -Type A -Name "example.com" -ErrorAction Stop
         return $true
     } catch {
         return $false
@@ -202,16 +166,16 @@ function Get-DohHost {
 }
 
 function Test-Tcp443 {
-    param([string]$dohHost)
+    param([string]$TargetHost)
     try {
-        $r = Test-NetConnection -ComputerName $dohHost -Port 443 -InformationLevel Quiet
-        return [bool]$r
+        $r = Test-NetConnection -ComputerName $TargetHost -Port 443
+        if ($null -ne $r -and $r.TcpTestSucceeded) { return $true }
+        return $false
     } catch { return $false }
 }
 
 # ------------------------------------------------------------------------
-# DNS query builder (application/dns-message)
-# Build a minimal standard recursive query for A record (example.com)
+# DNS query builder (application/dns-message) for DoH probe
 # ------------------------------------------------------------------------
 function New-DnsQueryBytes {
     param(
@@ -233,7 +197,6 @@ function New-DnsQueryBytes {
     $bytes = New-Object System.Collections.Generic.List[byte]
     $bytes.AddRange([byte[]]@($idHi,$idLo,$flagsHi,$flagsLo,$qdcountHi,$qdcountLo,$ancountHi,$ancountLo,$nscountHi,$nscountLo,$arcountHi,$arcountLo))
 
-    # QNAME: label lengths + label bytes + 0x00
     foreach ($label in $Name.Split('.')) {
         $lb = [System.Text.Encoding]::ASCII.GetBytes($label)
         $bytes.Add([byte]$lb.Length)
@@ -241,13 +204,11 @@ function New-DnsQueryBytes {
     }
     $bytes.Add(0x00)
 
-    # QTYPE
     $qtypeMap = @{ A=1; AAAA=28; NS=2; CNAME=5; MX=15; TXT=16 }
     $qcode = [int]$qtypeMap[$QType]
     $bytes.AddRange([byte[]]@((($qcode -band 0xFF00) -shr 8), ($qcode -band 0x00FF)))
 
-    # QCLASS = IN(1)
-    $bytes.AddRange([byte[]]@(0x00,0x01))
+    $bytes.AddRange([byte[]]@(0x00,0x01)) # QCLASS = IN(1)
 
     return ,([byte[]]$bytes)
 }
@@ -262,26 +223,21 @@ function Test-DohTemplate {
     )
     if (-not $TemplateUrl) { return $false }
 
-    # Prepare query bytes
     $q = New-DnsQueryBytes -Name $ProbeName -QType 'A'
 
-    # HTTP client
     $handler = New-Object System.Net.Http.HttpClientHandler
     $handler.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
     $client = New-Object System.Net.Http.HttpClient($handler)
     $client.Timeout = [TimeSpan]::FromSeconds(7)
 
-    # Helper to check DNS response header (QR flag set)
     function Test-DnsResponseHeader([byte[]]$resp) {
         if (-not $resp -or $resp.Length -lt 12) { return $false }
-        # Flags are bytes 2..3 of header (0-based indexing); QR is high bit of that 16-bit field
         $flags = ($resp[2] -shl 8) -bor $resp[3]
         $isResponse = ($flags -band 0x8000) -ne 0
         return $isResponse
     }
 
     try {
-        # 1) Try POST
         $content = New-Object System.Net.Http.ByteArrayContent($q)
         $content.Headers.ContentType = 'application/dns-message'
         $content.Headers.Add('Accept','application/dns-message')
@@ -289,14 +245,11 @@ function Test-DohTemplate {
         $resp = $client.PostAsync($TemplateUrl, $content).GetAwaiter().GetResult()
         if ($resp.IsSuccessStatusCode) {
             $bytes = $resp.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult()
-            if (Test-DnsResponseHeader $bytes) {
-                return $true
-            }
+            if (Test-DnsResponseHeader $bytes) { return $true }
         }
     } catch { }
 
     try {
-        # 2) GET fallback: ?dns=<base64url(dns-message)>
         $b64 = [Convert]::ToBase64String($q)
         $b64url = $b64.TrimEnd('=').Replace('+','-').Replace('/','_')
         $sep = '?'
@@ -308,9 +261,7 @@ function Test-DohTemplate {
         $resp2 = $client.SendAsync($req).GetAwaiter().GetResult()
         if ($resp2.IsSuccessStatusCode) {
             $bytes2 = $resp2.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult()
-            if (Test-DnsResponseHeader $bytes2) {
-                return $true
-            }
+            if (Test-DnsResponseHeader $bytes2) { return $true }
         }
     } catch { }
 
@@ -318,15 +269,15 @@ function Test-DohTemplate {
 }
 
 # ------------------------------------------------------------------------
-# Windows: set Windows Adapter IPv4 DNS
+# Windows: set Windows Adapter IPv4 DNS (per NIC) with before/after
 # ------------------------------------------------------------------------
 function Set-AdapterDnsIPv4 {
     param([ipaddress]$Dns1, [ipaddress]$Dns2)
 
     Write-Info "Applying adapter IPv4 DNS servers to active interfaces..."
-    $rows = Get-DnsClient -AddressFamily IPv4 -ErrorAction Stop | Where-Object {
+    $rows = Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction Stop | Where-Object {
         $_.InterfaceAlias -notmatch 'Loopback|Virtual|Tunneling|isatap|TAP|VPN'
-    }
+    } | Select-Object -Unique InterfaceAlias, InterfaceIndex
 
     if (-not $rows -or $rows.Count -eq 0) {
         Write-Warn "  No suitable IPv4 DNS client interfaces found."
@@ -343,18 +294,46 @@ function Set-AdapterDnsIPv4 {
     }
 
     foreach ($a in $rows) {
-        Write-Info ("  - {0} (Idx {1}) -> {2}" -f $a.InterfaceAlias, $a.InterfaceIndex, ($servers -join ', '))
-        Set-DnsClientServerAddress -InterfaceIndex $a.InterfaceIndex -ServerAddresses $servers -ErrorAction Stop
-        Write-OK "    Applied."
+        Write-Info ("  - {0} (Idx {1})" -f $a.InterfaceAlias, $a.InterfaceIndex)
+
+        $beforeObj = $null
+        try { $beforeObj = Get-DnsClientServerAddress -InterfaceIndex $a.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue } catch {}
+        $beforeList = @()
+        if ($beforeObj -and $beforeObj.ServerAddresses) { $beforeList = $beforeObj.ServerAddresses }
+        $beforeStr = if ($beforeList -and $beforeList.Count -gt 0) { ($beforeList -join ', ') } else { '(none)' }
+        Write-Info ("    Before: {0}" -f $beforeStr)
+
+        try {
+            Set-DnsClientServerAddress -InterfaceIndex $a.InterfaceIndex -ServerAddresses $servers -ErrorAction Stop
+            Write-OK "    Applied."
+        } catch {
+            Write-Err ("    Failed to set DNS servers: {0}" -f $_.Exception.Message)
+            continue
+        }
+
+        $afterObj = $null
+        try { $afterObj = Get-DnsClientServerAddress -InterfaceIndex $a.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue } catch {}
+        $afterList = @()
+        if ($afterObj -and $afterObj.ServerAddresses) { $afterList = $afterObj.ServerAddresses }
+        $afterStr = if ($afterList -and $afterList.Count -gt 0) { ($afterList -join ', ') } else { '(none)' }
+        Write-Info ("    After:  {0}" -f $afterStr)
     }
 }
 
 # ------------------------------------------------------------------------
-# Windows: register DNS DoH template (IP -> HTTPS template)
+# Windows: register DNS DoH template (IP -> HTTPS template), before/after
 # ------------------------------------------------------------------------
 function Register-DohTemplate {
     param([string]$ServerIP, [string]$Template)
     if (-not $ServerIP -or -not $Template) { return }
+
+    # BEFORE
+    $before = $null
+    try { 
+        $before = Get-DnsClientDohServerAddress -ErrorAction SilentlyContinue | Where-Object { $_.ServerAddress -eq $ServerIP } 
+    } catch {}
+    $beforeTpl = $null
+    if ($before) { $beforeTpl = $before.DohTemplate }
 
     $addCmd = Get-Command Add-DnsClientDohServerAddress -ErrorAction SilentlyContinue
     if ($addCmd) {
@@ -362,41 +341,86 @@ function Register-DohTemplate {
             Add-DnsClientDohServerAddress -ServerAddress $ServerIP -DohTemplate $Template -AutoUpgrade:$true -AllowFallbackToUdp:$true -ErrorAction Stop
             Write-OK ("  Registered DoH template: {0} -> {1}" -f $ServerIP, $Template)
         } catch {
-            Write-Warn ("  Cmdlet for DoH template registration failed ({0}); trying netsh..." -f $_.Exception.Message)
-            $args = @('dns','add','encryption', "server=$ServerIP", "dohtemplate=$Template", 'autoupgrade=yes', 'udpfallback=yes')
-            & netsh @args | Out-Null
-            if ($LASTEXITCODE -ne 0) {throw "netsh failed with exit code $LASTEXITCODE for $ServerIP -> $Template" }
-            Write-OK ("  Registered DoH template via netsh: {0} -> {1}" -f $ServerIP, $Template)
+            $msg = $_.Exception.Message
+            if ($msg -match "already exists") {
+                Write-OK ("  DoH template already registered: {0} -> {1}" -f $ServerIP, $Template)
+            } else {
+                Write-Warn ("  Cmdlet registration failed ({0}); trying netsh..." -f $msg)
+                $args = @('dns','add','encryption', "server=$ServerIP", "dohtemplate=$Template", 'autoupgrade=yes', 'udpfallback=yes')
+                & netsh @args | Out-Null
+                if ($LASTEXITCODE -ne 0) { throw "netsh failed with exit code $LASTEXITCODE for $ServerIP -> $Template" }
+                Write-OK ("  Registered DoH template via netsh: {0} -> {1}" -f $ServerIP, $Template)
+            }
         }
     } else {
-        # Build args array for netsh call (PowerShell-safe quoting)
         $args = @('dns','add','encryption', "server=$ServerIP", "dohtemplate=$Template", 'autoupgrade=yes', 'udpfallback=yes')
         & netsh @args | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "netsh failed with exit code $LASTEXITCODE for $ServerIP -> $Template" }
         Write-OK ("  Registered DoH template via netsh: {0} -> {1}" -f $ServerIP, $Template)
     }
+
+    # AFTER
+    $after = $null
+    try { 
+        $after = Get-DnsClientDohServerAddress -ErrorAction SilentlyContinue | Where-Object { $_.ServerAddress -eq $ServerIP } 
+    } catch {}
+    $afterTpl = $null
+    if ($after) { $afterTpl = $after.DohTemplate }
+
+    $beforeStr = if ($beforeTpl) { ("{0} -> {1}" -f $ServerIP, $beforeTpl) } else { "(none)" }
+    $afterStr  = if ($afterTpl)  { ("{0} -> {1}" -f $ServerIP, $afterTpl) } else { "(none)" }
+    Write-Info ("    Before: {0}" -f $beforeStr)
+    Write-Info ("    After:  {0}" -f $afterStr)
 }
 
 # ------------------------------------------------------------------------
-# Windows: set Windows DoH policy (Windows Registry HKLM policy path)
+# Windows: set DoH policy (Windows Registry HKLM policy path), before/after
 # ------------------------------------------------------------------------
 function Set-WindowsDohPolicy {
-    param([WinDohPolicy]$WinPolicy)
+    param([WinDohPolicy]$Policy)
+
+    function Map-Policy([int]$v) {
+        switch ($v) {
+            0 { return "Off" }
+            1 { return "Allow" }
+            2 { return "Require" }
+            default { return "(not set)" }
+        }
+    }
 
     try {
         $path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient"
         if (-not (Test-Path $path)) { New-Item -Path $path -Force -ErrorAction Stop | Out-Null }
 
+        # BEFORE
+        $beforeVal = $null
+        try {
+            $prop = Get-ItemProperty -Path $path -Name "DoHPolicy" -ErrorAction SilentlyContinue
+            if ($prop) { $beforeVal = [int]$prop.DoHPolicy }
+        } catch {}
+
         $v = $null
-        switch ($WinPolicy) {
+        switch ($Policy) {
             'Off'     { $v = 0 }
             'Allow'   { $v = 1 }
             'Require' { $v = 2 }
-            default   { return } # Unchanged -> do nothing
+            default   { return }
         }
 
         Set-ItemProperty -Path $path -Name "DoHPolicy" -Type DWord -Value $v -ErrorAction Stop
-        Write-OK ("Windows DNS DoH policy set to {0} ({1})" -f $WinPolicy, $v)
+
+        # AFTER
+        $afterVal = $v
+        try {
+            $prop2 = Get-ItemProperty -Path $path -Name "DoHPolicy" -ErrorAction SilentlyContinue
+            if ($prop2) { $afterVal = [int]$prop2.DoHPolicy }
+        } catch {}
+
+        Write-OK ("Windows DNS DoH policy set to {0} ({1})" -f $Policy, $v)
+        $beforeStr = if ($beforeVal -ne $null) { ("{0} ({1})" -f $beforeVal, (Map-Policy $beforeVal)) } else { "(not set)" }
+        $afterStr  = if ($afterVal  -ne $null) { ("{0} ({1})" -f $afterVal,  (Map-Policy $afterVal)) }  else { "(not set)" }
+        Write-Info ("    Before: {0}" -f $beforeStr)
+        Write-Info ("    After:  {0}" -f $afterStr)
     } catch {
         Write-Err ("Failed to set Windows DoH policy: {0}" -f $_.Exception.Message)
         throw
@@ -404,7 +428,7 @@ function Set-WindowsDohPolicy {
 }
 
 # ------------------------------------------------------------------------
-# Chrome (per-user Windows HKCU policy)
+# Chrome (per-user HKCU policy)
 # ------------------------------------------------------------------------
 function Set-ChromePolicy {
     param([TriState]$State, [string[]]$Templates)
@@ -412,26 +436,36 @@ function Set-ChromePolicy {
     if ($State -eq [TriState]::Unchanged) { Write-Warn "Skipping Chrome (Unchanged)."; return }
 
     $base = "HKCU:\SOFTWARE\Policies\Google\Chrome"
-    if (-not (Test-Path $base)) { New-Item -Path $base -Force -ErrorAction Stop | Out-Null }
+    if (-not (Test-Path $base)) { New-Item -Path $base -Force | Out-Null }
 
     $templatesString = ($Templates | Where-Object { $_ }) -join ' '
 
     switch ($State) {
         'Enable' {
-            if ($templatesString) {
-                New-ItemProperty -Path $base -Name "DnsOverHttpsMode" -PropertyType String -Value "secure" -Force -ErrorAction Stop | Out-Null
-                New-ItemProperty -Path $base -Name "DnsOverHttpsTemplates" -PropertyType String -Value $templatesString -Force -ErrorAction Stop | Out-Null
-                Write-OK "Chrome DoH: secure; templates set (HKCU)."
-            } else {
-                New-ItemProperty -Path $base -Name "DnsOverHttpsMode" -PropertyType String -Value "automatic" -Force -ErrorAction Stop | Out-Null
-                Remove-ItemProperty -Path $base -Name "DnsOverHttpsTemplates" -ErrorAction SilentlyContinue
-                Write-Warn "Chrome DoH: automatic (no templates provided)."
+            try {
+                if ($templatesString) {
+                    New-ItemProperty -Path $base -Name "DnsOverHttpsMode" -PropertyType String -Value "secure" -Force -ErrorAction Stop | Out-Null
+                    New-ItemProperty -Path $base -Name "DnsOverHttpsTemplates" -PropertyType String -Value $templatesString -Force -ErrorAction Stop | Out-Null
+                    Write-OK "Chrome DoH: secure; templates set (HKCU)."
+                } else {
+                    New-ItemProperty -Path $base -Name "DnsOverHttpsMode" -PropertyType String -Value "automatic" -Force -ErrorAction Stop | Out-Null
+                    Remove-ItemProperty -Path $base -Name "DnsOverHttpsTemplates" -ErrorAction SilentlyContinue
+                    Write-Warn "Chrome DoH: automatic (no templates provided)."
+                }
+            } catch {
+                Write-Err ("Chrome policy write failed: {0}" -f $_.Exception.Message)
+                $script:HadError = $true
             }
         }
         'Disable' {
-            New-ItemProperty -Path $base -Name "DnsOverHttpsMode" -PropertyType String -Value "off" -Force -ErrorAction Stop | Out-Null
-            Remove-ItemProperty -Path $base -Name "DnsOverHttpsTemplates" -ErrorAction SilentlyContinue
-            Write-OK "Chrome DoH: disabled (HKCU)."
+            try {
+                New-ItemProperty -Path $base -Name "DnsOverHttpsMode" -PropertyType String -Value "off" -Force -ErrorAction Stop | Out-Null
+                Remove-ItemProperty -Path $base -Name "DnsOverHttpsTemplates" -ErrorAction SilentlyContinue
+                Write-OK "Chrome DoH: disabled (HKCU)."
+            } catch {
+                Write-Err ("Chrome policy write failed: {0}" -f $_.Exception.Message)
+                $script:HadError = $true
+            }
         }
     }
 }
@@ -498,7 +532,6 @@ function Set-FirefoxDoh {
 Write-Headline "=== DNS over HTTPS Configuration ==="
 
 # Compute the candidate IPs that we will consider for template registration / checks
-# If you intend to change adapter DNS in this run, we prefer those provided IPs.
 $existingIPs = Get-CurrentAdapterDnsIPv4
 $candidateIPs = @()
 if ($ApplyAdapterDNS -and ($PSBoundParameters.ContainsKey('PrimaryDNS') -or $PSBoundParameters.ContainsKey('SecondaryDNS'))) {
@@ -540,15 +573,18 @@ if ($ApplyAdapterDNS) {
 # ------------------------------------------------------------------------
 try {
     if ($WindowsDoH -ne [TriState]::Unchanged) {
-        $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).
-                   IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
+        # --- FIX: robust admin check (no fragile line continuation) ---
+        $currIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal    = New-Object Security.Principal.WindowsPrincipal($currIdentity)
+        $isAdmin      = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        # ---------------------------------------------------------------
 
         if (-not $isAdmin) {
             Write-Err "WindowsDoH requested, but the script is not running elevated. Skipping Windows."
         } else {
             Write-Headline "Windows: preflight checks"
 
-            # 1) Plain DNS liveness (TCP/53) — at least one candidate should respond, unless you intend Require with known good DoH
+            # 1) Plain DNS liveness (TCP/53)
             $plainOK = $false
             foreach ($ip in $candidateIPs) {
                 $ok = Test-PlainDnsTcp -ServerIP $ip
@@ -569,16 +605,16 @@ try {
             }
             $templatesForWindows = $templatesForWindows | Select-Object -Unique
 
-            # Determine effective policy we aim for
+            # Determine intended policy
             $requestedPolicy = $WindowsPolicy
             if ($WindowsDoH -eq [TriState]::Enable -and $requestedPolicy -eq [WinDohPolicy]::Unchanged) {
-                $requestedPolicy = [WinDohPolicy]::Allow  # safe default
+                $requestedPolicy = [WinDohPolicy]::Allow
             }
             if ($WindowsDoH -eq [TriState]::Disable) {
                 $requestedPolicy = [WinDohPolicy]::Off
             }
 
-            # 3) If Require is requested, we must have known templates and they must pass 443 + DoH probe
+            # 3) If Require is requested, verify 443 + DoH probe
             $canRequire = $true
             if ($requestedPolicy -eq [WinDohPolicy]::Require) {
                 if (-not $templatesForWindows -or $templatesForWindows.Count -eq 0) {
@@ -587,7 +623,7 @@ try {
                 } else {
                     foreach ($tpl in $templatesForWindows) {
                         $dohHost = Get-DohHost -Template $tpl
-                        $h443 = Test-Tcp443 -Host $dohHost
+                        $h443 = Test-Tcp443 -TargetHost $dohHost
                         Write-Info ("  443 to {0}: {1}" -f $dohHost, ($(if ($h443) { 'OK' } else { 'Fail' })))
                         if (-not $h443) { $canRequire = $false }
 
@@ -601,60 +637,32 @@ try {
                 }
             }
 
-            # 4) Apply policy: Off / Allow / Require (with two-phase for Require)
+            # 4) Apply policy: Off / Allow / Require (two-phase for Require)
             switch ($requestedPolicy) {
-                'Off' {
-                    Set-WindowsDohPolicy -WinPolicy ([WinDohPolicy]::Off)
-                }
-                'Allow' {
-                    # We prefer to have at least one plain DNS OK, but still apply Allow even if plaintext is down,
-                    # since DoH may still succeed.
-                    Set-WindowsDohPolicy -WinPolicy ([WinDohPolicy]::Allow)
-                    # Flush DNS to apply quickly
-                    Write-Info "Flushing DNS cache..."
-                    ipconfig /flushdns | Out-Null
-                    if ($LASTEXITCODE -ne 0) {
-                        Write-Warn "DNS cache flush using ipconfig /flushdns fail, exited with code $LASTEXITCODE." 
-                    } else {
-                        Write-OK "DNS cache flushed using ipconfig /flushdns"
-                    }
-
-                    # Smoke test OS resolution
-                    try {
-                        $res = Resolve-DnsName -Name "example.com" -Type A -ErrorAction Stop
-                        Write-OK "OS resolver test (example.com): OK"
-                    } catch {
-                        Write-Warn "OS resolver test failed after Allow; name resolution may be impaired."
-                    }
-                }
+                'Off'   { Set-WindowsDohPolicy -Policy ([WinDohPolicy]::Off) }
+                'Allow' { Set-WindowsDohPolicy -Policy ([WinDohPolicy]::Allow) }
                 'Require' {
                     if (-not $canRequire) {
                         Write-Err "Blocking Require due to failing preflight checks. Applying Allow for safety."
-                        Set-WindowsDohPolicy -WinPolicy ([WinDohPolicy]::Allow)
+                        Set-WindowsDohPolicy -Policy ([WinDohPolicy]::Allow)
                     } else {
-                        # Phase 1: Allow
-                        Set-WindowsDohPolicy -WinPolicy ([WinDohPolicy]::Allow)
-                        Write-Info "Flushing DNS cache using ipconfig /flushdns ..."
-                        ipconfig /flushdns | Out-Null
-                        if ($LASTEXITCODE -ne 0) {
-                            Write-Warn "DNS cache flush using ipconfig /flushdns fail, exited with code $LASTEXITCODE."
-                        } else {
-                            Write-OK "DNS cache flushed using ipconfig /flushdns"
-                        }
+                        Set-WindowsDohPolicy -Policy ([WinDohPolicy]::Allow)
 
-                        # Verify OS resolver works under Allow
+                        Write-Info "Flushing DNS cache..."
+                        ipconfig /flushdns | Out-Null
+                        if ($LASTEXITCODE -ne 0) { Write-Warn ("DNS cache flush exited with code {0}" -f $LASTEXITCODE) } else { Write-OK "DNS cache flushed." }
+
                         $allowOK = $false
                         try {
-                            $res = Resolve-DnsName -Name "example.com" -Type A -ErrorAction Stop
+                            $null = Resolve-DnsName -Name "example.com" -Type A -ErrorAction Stop
                             $allowOK = $true
                             Write-OK "OS resolver test (example.com) under Allow: OK"
                         } catch {
-                            Write-Err "OS resolver test failed under Allow; refusing to promote Allow to Require."
+                            Write-Err "OS resolver test failed under Allow; refusing to promote to Require."
                         }
 
-                        # Phase 2: Promote to Require if Allow succeeded
                         if ($allowOK) {
-                            Set-WindowsDohPolicy -WinPolicy ([WinDohPolicy]::Require)
+                            Set-WindowsDohPolicy -Policy ([WinDohPolicy]::Require)
                             Write-OK "Promoted to Require."
                         } else {
                             Write-Warn "Staying on Allow due to failed test."
@@ -663,9 +671,21 @@ try {
                 }
                 default {
                     Write-Warn "WindowsDoH=Enable but WindowsPolicy=Unchanged; applied Allow as a safe default."
-                    Set-WindowsDohPolicy -WinPolicy ([WinDohPolicy]::Allow)
+                    Set-WindowsDohPolicy -Policy ([WinDohPolicy]::Allow)
                 }
             }
+
+            # Effective policy read-back
+            try {
+                $reg = Get-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient" -Name "DoHPolicy" -ErrorAction SilentlyContinue
+                $eff = if ($reg) { [int]$reg.DoHPolicy } else { $null }
+                if ($eff -ne $null) {
+                    $label = switch ($eff) { 0 { "Off" } 1 { "Allow" } 2 { "Require" } default { "(unknown)" } }
+                    Write-Info ("Effective Windows DoH policy: {0} ({1})" -f $label, $eff)
+                } else {
+                    Write-Info "Effective Windows DoH policy: (not set)"
+                }
+            } catch {}
         }
     } else {
         Write-Warn "Skipping Windows (Unchanged)."
@@ -680,7 +700,6 @@ try {
 # ------------------------------------------------------------------------
 try {
     if ($ChromeDoH -ne [TriState]::Unchanged) {
-        # Build templates for Chrome: prefer those associated with candidate IPs (if any)
         Set-ChromePolicy -State $ChromeDoH -Templates $knownTemplates
     } else {
         Write-Warn "Skipping Chrome (Unchanged)."
@@ -695,15 +714,12 @@ try {
 # ------------------------------------------------------------------------
 try {
     if ($FirefoxDoH -ne [TriState]::Unchanged) {
-        # Firefox takes a single primary URI + optional bootstrapAddress
         $primaryTpl = $null
         $bootstrap  = $null
         if ($knownTemplates -and $knownTemplates.Count -gt 0) {
             $primaryTpl = $knownTemplates[0]
-            # if our candidate pool has a single dominant IP, use it as bootstrap
             if ($candidateIPs -and $candidateIPs.Count -gt 0) { $bootstrap = $candidateIPs[0] }
         }
-
         Set-FirefoxDoh -State $FirefoxDoH -PrimaryTemplate $primaryTpl -BootstrapIP $bootstrap
     } else {
         Write-Warn "Skipping Firefox (Unchanged)."
@@ -718,7 +734,7 @@ try {
 # ------------------------------------------------------------------------
 Write-Host ""
 Write-Headline "=== Summary ==="
-Write-Info ("Windows:  {0} (Policy: {1})" -f $WindowsDoH, $WindowsPolicy)
+Write-Info ("Windows:  {0} (Policy requested: {1})" -f $WindowsDoH, $WindowsPolicy)
 Write-Info ("Chrome:   {0}" -f $ChromeDoH)
 Write-Info ("Firefox:  {0}" -f $FirefoxDoH)
 
@@ -746,7 +762,7 @@ try {
     $names = @('example.com','cloudflare.com','quad9.net')
     foreach ($n in $names) {
         $ok = $false
-        try { $res = Resolve-DnsName -Name $n -Type A -ErrorAction Stop; $ok = $true } catch {}
+        try { $null = Resolve-DnsName -Name $n -Type A -ErrorAction Stop; $ok = $true } catch {}
         if ($ok) { Write-OK   ("  {0}: OK" -f $n) } else { Write-Warn ("  {0}: Failed" -f $n) }
     }
 } catch {
