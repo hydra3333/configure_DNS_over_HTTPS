@@ -364,7 +364,7 @@ function Register-DohTemplate {
 }
 
 # ------------------------------------------------------------------------
-# Windows: set DoH policy (Windows Registry HKLM policy path)
+# Windows: set Windows DoH policy (Windows Registry HKLM policy path)
 # ------------------------------------------------------------------------
 function Set-WindowsDohPolicy {
     param([WinDohPolicy]$WinPolicy)
@@ -385,7 +385,7 @@ function Set-WindowsDohPolicy {
 }
 
 # ------------------------------------------------------------------------
-# Chrome (per-user HKCU policy)
+# Chrome (per-user Windows HKCU policy)
 # ------------------------------------------------------------------------
 function Set-ChromePolicy {
     param([TriState]$State, [string[]]$Templates)
@@ -476,7 +476,7 @@ function Set-FirefoxDoh {
 # ------------------------------------------------------------------------
 # BEGIN EXECUTION
 # ------------------------------------------------------------------------
-Write-Headline "=== DNS over HTTPS Configuration (Safe Mode) ==="
+Write-Headline "=== DNS over HTTPS Configuration ==="
 
 # Compute the candidate IPs that we will consider for template registration / checks
 # If you intend to change adapter DNS in this run, we prefer those provided IPs.
