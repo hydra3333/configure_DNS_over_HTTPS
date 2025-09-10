@@ -620,12 +620,12 @@ try {
                     } else {
                         # Phase 1: Allow
                         Set-WindowsDohPolicy -WinPolicy ([WinDohPolicy]::Allow)
-                        Write-Info "Flushing DNS cache..."
+                        Write-Info "Flushing DNS cache using ipconfig /flushdns ..."
                         ipconfig /flushdns | Out-Null
                         if ($LASTEXITCODE -ne 0) {
                             Write-Warn "DNS cache flush using ipconfig /flushdns fail, exited with code $LASTEXITCODE."
                         } else {
-                            Write-OK "DNS cache flushed ipconfig /flushdns"
+                            Write-OK "DNS cache flushed using ipconfig /flushdns"
                         }
 
                         # Verify OS resolver works under Allow
@@ -635,7 +635,7 @@ try {
                             $allowOK = $true
                             Write-OK "OS resolver test (example.com) under Allow: OK"
                         } catch {
-                            Write-Err "OS resolver test failed under Allow; refusing to promote to Require."
+                            Write-Err "OS resolver test failed under Allow; refusing to promote Allow to Require."
                         }
 
                         # Phase 2: Promote to Require if Allow succeeded
