@@ -316,9 +316,7 @@ function Set-AdapterDnsIPv4 {
     param([ipaddress]$Dns1, [ipaddress]$Dns2)
 
     Write-Info "Applying adapter IPv4 DNS servers to active interfaces..."
-    $rows = Get-DnsClient -AddressFamily IPv4 -ErrorAction Stop | Where-Object {
-        $_.InterfaceAlias -notmatch 'Loopback|Virtual|Tunneling|isatap|TAP|VPN'
-    }
+    $rows = Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction Stop | Where-Object { $_.InterfaceAlias -notmatch 'Loopback|Virtual|Tunneling|isatap|TAP|VPN' } | Select-Object -Unique InterfaceAlias, InterfaceIndex
 
     if (-not $rows -or $rows.Count -eq 0) {
         Write-Warn "  No suitable IPv4 DNS client interfaces found."
@@ -578,9 +576,9 @@ try {
                     Write-Err "Cannot set Require: no known DoH templates for candidate IPs."
                 } else {
                     foreach ($tpl in $templatesForWindows) {
-                        $host = Get-DohHost -Template $tpl
+                        $dohHost = Get-DohHost -Template $tpl
                         $h443 = Test-Tcp443 -Host $host
-                        Write-Info ("  443 to {0}: {1}" -f $host, ($(if ($h443) { 'OK' } else { 'Fail' })))
+                        Write-Info ("  443 to {0}: {1}" -f $dohHost, ($(if ($h443) { 'OK' } else { 'Fail' })))
                         if (-not $h443) { $canRequire = $false }
 
                         $probe = $false
