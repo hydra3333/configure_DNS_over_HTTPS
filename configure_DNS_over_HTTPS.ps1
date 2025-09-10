@@ -369,19 +369,24 @@ function Register-DohTemplate {
 function Set-WindowsDohPolicy {
     param([WinDohPolicy]$WinPolicy)
 
-    $path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient"
-    if (-not (Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
+    try {
+        $path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient"
+        if (-not (Test-Path $path)) { New-Item -Path $path -Force -ErrorAction Stop | Out-Null }
 
-    $v = $null
-    switch ($WinPolicy) {
-        'Off'     { $v = 0 }
-        'Allow'   { $v = 1 }
-        'Require' { $v = 2 }
-        default   { return } # Unchanged -> do nothing
+        $v = $null
+        switch ($WinPolicy) {
+            'Off'     { $v = 0 }
+            'Allow'   { $v = 1 }
+            'Require' { $v = 2 }
+            default   { return } # Unchanged -> do nothing
+        }
+
+        Set-ItemProperty -Path $path -Name "DoHPolicy" -Type DWord -Value $v -ErrorAction Stop
+        Write-OK ("Windows DNS DoH policy set to {0} ({1})" -f $WinPolicy, $v)
+    } catch {
+        Write-Err ("Failed to set Windows DoH policy: {0}" -f $_.Exception.Message)
+        throw
     }
-
-    Set-ItemProperty -Path $path -Name "DoHPolicy" -Type DWord -Value $v
-    Write-OK ("Windows DNS DoH policy set to {0} ({1})" -f $WinPolicy, $v)
 }
 
 # ------------------------------------------------------------------------
@@ -393,24 +398,24 @@ function Set-ChromePolicy {
     if ($State -eq [TriState]::Unchanged) { Write-Warn "Skipping Chrome (Unchanged)."; return }
 
     $base = "HKCU:\SOFTWARE\Policies\Google\Chrome"
-    if (-not (Test-Path $base)) { New-Item -Path $base -Force | Out-Null }
+    if (-not (Test-Path $base)) { New-Item -Path $base -Force -ErrorAction Stop | Out-Null }
 
     $templatesString = ($Templates | Where-Object { $_ }) -join ' '
 
     switch ($State) {
         'Enable' {
             if ($templatesString) {
-                New-ItemProperty -Path $base -Name "DnsOverHttpsMode" -PropertyType String -Value "secure" -Force | Out-Null
-                New-ItemProperty -Path $base -Name "DnsOverHttpsTemplates" -PropertyType String -Value $templatesString -Force | Out-Null
+                New-ItemProperty -Path $base -Name "DnsOverHttpsMode" -PropertyType String -Value "secure" -Force -ErrorAction Stop | Out-Null
+                New-ItemProperty -Path $base -Name "DnsOverHttpsTemplates" -PropertyType String -Value $templatesString -Force -ErrorAction Stop | Out-Null
                 Write-OK "Chrome DoH: secure; templates set (HKCU)."
             } else {
-                New-ItemProperty -Path $base -Name "DnsOverHttpsMode" -PropertyType String -Value "automatic" -Force | Out-Null
+                New-ItemProperty -Path $base -Name "DnsOverHttpsMode" -PropertyType String -Value "automatic" -Force -ErrorAction Stop | Out-Null
                 Remove-ItemProperty -Path $base -Name "DnsOverHttpsTemplates" -ErrorAction SilentlyContinue
                 Write-Warn "Chrome DoH: automatic (no templates provided)."
             }
         }
         'Disable' {
-            New-ItemProperty -Path $base -Name "DnsOverHttpsMode" -PropertyType String -Value "off" -Force | Out-Null
+            New-ItemProperty -Path $base -Name "DnsOverHttpsMode" -PropertyType String -Value "off" -Force -ErrorAction Stop | Out-Null
             Remove-ItemProperty -Path $base -Name "DnsOverHttpsTemplates" -ErrorAction SilentlyContinue
             Write-OK "Chrome DoH: disabled (HKCU)."
         }
@@ -594,7 +599,11 @@ try {
                     # Flush DNS to apply quickly
                     Write-Info "Flushing DNS cache..."
                     ipconfig /flushdns | Out-Null
-                    Write-OK  "DNS cache flushed."
+                    if ($LASTEXITCODE -ne 0) {
+                        Write-Warn "DNS cache flush using ipconfig /flushdns fail, exited with code $LASTEXITCODE." 
+                    } else {
+                        Write-OK "DNS cache flushed using ipconfig /flushdns"
+                    }
 
                     # Smoke test OS resolution
                     try {
@@ -613,7 +622,11 @@ try {
                         Set-WindowsDohPolicy -WinPolicy ([WinDohPolicy]::Allow)
                         Write-Info "Flushing DNS cache..."
                         ipconfig /flushdns | Out-Null
-                        Write-OK "DNS cache flushed."
+                        if ($LASTEXITCODE -ne 0) {
+                            Write-Warn "DNS cache flush using ipconfig /flushdns fail, exited with code $LASTEXITCODE."
+                        } else {
+                            Write-OK "DNS cache flushed ipconfig /flushdns"
+                        }
 
                         # Verify OS resolver works under Allow
                         $allowOK = $false
