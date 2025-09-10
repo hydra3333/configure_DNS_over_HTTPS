@@ -135,17 +135,49 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -NonInteractive -WindowStyle H
 
 ## Extending resolver support
 
-Add entries to the in-script **IP -> DoH template** map as you verify providers, e.g.:
+Add entries to the in-script **IP -> DoH template** map as you verify secure DNS providers, eg:
 
 ```
-'1.1.1.1'         = 'https://cloudflare-dns.com/dns-query'
-'8.8.8.8'         = 'https://dns.google/dns-query'
-'9.9.9.9'         = 'https://dns.quad9.net/dns-query'
-'202.142.142.142' = 'https://dnscache1.aussiebroadband.com.au/dns-query'
-…
+$dnsToDohMap = @{
+    # Aussie Broadband (ABB)
+    '202.142.142.142' = 'https://dnscache1.aussiebroadband.com.au/dns-query'
+    '202.142.142.242' = 'https://dnscache2.aussiebroadband.com.au/dns-query'
+
+    # Cloudflare (standard)
+    '1.1.1.1'         = 'https://cloudflare-dns.com/dns-query'
+    '1.0.0.1'         = 'https://cloudflare-dns.com/dns-query'
+
+    # Cloudflare (security)
+    '1.1.1.2'         = 'https://security.cloudflare-dns.com/dns-query'
+    '1.0.0.2'         = 'https://security.cloudflare-dns.com/dns-query'
+
+    # Cloudflare (family)
+    '1.1.1.3'         = 'https://family.cloudflare-dns.com/dns-query'
+    '1.0.0.3'         = 'https://family.cloudflare-dns.com/dns-query'
+
+    # Google Public DNS
+    '8.8.8.8'         = 'https://dns.google/dns-query'
+    '8.8.4.4'         = 'https://dns.google/dns-query'
+
+    # Quad9
+    '9.9.9.9'         = 'https://dns.quad9.net/dns-query'
+    '149.112.112.112' = 'https://dns.quad9.net/dns-query'
+
+    # OpenDNS (Cisco)
+    '208.67.222.222'  = 'https://doh.opendns.com/dns-query'
+    '208.67.220.220'  = 'https://doh.opendns.com/dns-query'
+
+    # AdGuard
+    '94.140.14.14'    = 'https://dns.adguard.com/dns-query'
+    '94.140.15.15'    = 'https://dns.adguard.com/dns-query'
+
+    # CleanBrowsing (Family filter; add others as needed)
+    '185.228.168.168' = 'https://doh.cleanbrowsing.org/dns-query'
+    '185.228.169.168' = 'https://doh.cleanbrowsing.org/dns-query'
+}
 ```
 
-If a resolver’s DoH endpoint isn’t known, the script will still allow **Allow** (prefers DoH; can fall back to plaintext) but will **block Require** to avoid bricking DNS.
+If a DNS resolver’s DoH endpoint isn’t known, the script will still allow **Allow** (ie prefers DoH; can fall back to plaintext) but will **block Require** to avoid bricking DNS.
 
 ---
 
