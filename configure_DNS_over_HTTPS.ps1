@@ -67,15 +67,15 @@
       -WindowsDoH Disable
 #>
 
-# -------------------------------
+# ------------------------------------------------------------------------
 # Enums (tri-state + Windows policy)
-# -------------------------------
+# ------------------------------------------------------------------------
 enum TriState    { Unchanged; Enable; Disable }
 enum WinDohPolicy { Unchanged; Off; Allow; Require }
 
-# -------------------------------
+# ------------------------------------------------------------------------
 # Parameters
-# -------------------------------
+# ------------------------------------------------------------------------
 [CmdletBinding()]
 param(
     # Optional: only used if -ApplyAdapterDNS is specified
@@ -92,9 +92,9 @@ param(
     [switch]$ApplyAdapterDNS
 )
 
-# -------------------------------
+# ------------------------------------------------------------------------
 # Globals / Helpers
-# -------------------------------
+# ------------------------------------------------------------------------
 $ErrorActionPreference = 'Stop'
 $script:HadError       = $false
 
@@ -104,19 +104,24 @@ function Write-OK($text)       { Write-Host $text -ForegroundColor Green }
 function Write-Warn($text)     { Write-Host $text -ForegroundColor Yellow }
 function Write-Err($text)      { Write-Host $text -ForegroundColor Red }
 
-# Known IPv4 DNS -> DoH Template mapping (curated)
+# ------------------------------------------------------------------------
+# Known IPv4 DNS -> DoH Template mapping.
 # Add to this as you verify providers. If a template is unknown, we can still run with Allow,
-# but Require will be blocked to avoid breaking resolution.
+# ... but Require will be blocked from being implemented so as to avoid breaking DNS on the PC.
 $dnsToDohMap = @{
     # Aussie Broadband (ABB)
     '202.142.142.142' = 'https://dnscache1.aussiebroadband.com.au/dns-query'
     '202.142.142.242' = 'https://dnscache2.aussiebroadband.com.au/dns-query'
 
-    # Cloudflare (standard, security, family)
+    # Cloudflare (standard)
     '1.1.1.1'         = 'https://cloudflare-dns.com/dns-query'
     '1.0.0.1'         = 'https://cloudflare-dns.com/dns-query'
+
+    # Cloudflare (security)
     '1.1.1.2'         = 'https://security.cloudflare-dns.com/dns-query'
     '1.0.0.2'         = 'https://security.cloudflare-dns.com/dns-query'
+
+    # Cloudflare (family)
     '1.1.1.3'         = 'https://family.cloudflare-dns.com/dns-query'
     '1.0.0.3'         = 'https://family.cloudflare-dns.com/dns-query'
 
@@ -141,9 +146,9 @@ $dnsToDohMap = @{
     '185.228.169.168' = 'https://doh.cleanbrowsing.org/dns-query'
 }
 
-# -------------------------------
-# Utility: gather current adapter IPv4 DNS IPs (unique)
-# -------------------------------
+# ------------------------------------------------------------------------
+# Utility: gather current Windows Adapter IPv4 DNS IPs (unique)
+# ------------------------------------------------------------------------
 function Get-CurrentAdapterDnsIPv4 {
     try {
         $rows = Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction Stop
@@ -155,14 +160,14 @@ function Get-CurrentAdapterDnsIPv4 {
         }
         return ($ips | Select-Object -Unique)
     } catch {
-        Write-Warn ("Could not enumerate adapter DNS IPv4 addresses: {0}" -f $_.Exception.Message)
+        Write-Warn ("Could not enumerate Windows Adapter DNS IPv4 addresses: {0}" -f $_.Exception.Message)
         return @()
     }
 }
 
-# -------------------------------
+# ------------------------------------------------------------------------
 # Utility: TCP/53 reachability (plaintext DNS liveness)
-# -------------------------------
+# ------------------------------------------------------------------------
 function Test-PlainDnsTcp {
     param([string]$ServerIP)
 
@@ -175,9 +180,9 @@ function Test-PlainDnsTcp {
     }
 }
 
-# -------------------------------
+# ------------------------------------------------------------------------
 # Utility: extract DoH host from template URL and test TCP/443
-# -------------------------------
+# ------------------------------------------------------------------------
 function Get-DohHost {
     param([string]$Template)
     try   { return ([uri]$Template).Host } catch { return $null }
@@ -191,10 +196,10 @@ function Test-Tcp443 {
     } catch { return $false }
 }
 
-# -------------------------------
+# ------------------------------------------------------------------------
 # DNS query builder (application/dns-message)
 # Build a minimal standard recursive query for A record (example.com)
-# -------------------------------
+# ------------------------------------------------------------------------
 function New-DnsQueryBytes {
     param(
         [string]$Name = 'example.com',
@@ -234,9 +239,9 @@ function New-DnsQueryBytes {
     return ,([byte[]]$bytes)
 }
 
-# -------------------------------
+# ------------------------------------------------------------------------
 # DoH probe: POST then GET fallback; validate DNS response header (QR bit)
-# -------------------------------
+# ------------------------------------------------------------------------
 function Test-DohTemplate {
     param(
         [string]$TemplateUrl,
@@ -298,9 +303,9 @@ function Test-DohTemplate {
     return $false
 }
 
-# -------------------------------
-# Windows: set adapter IPv4 DNS
-# -------------------------------
+# ------------------------------------------------------------------------
+# Windows: set Windows Adapter IPv4 DNS
+# ------------------------------------------------------------------------
 function Set-AdapterDnsIPv4 {
     param([ipaddress]$Dns1, [ipaddress]$Dns2)
 
@@ -330,9 +335,9 @@ function Set-AdapterDnsIPv4 {
     }
 }
 
-# -------------------------------
-# Windows: register DoH template (IP -> HTTPS template)
-# -------------------------------
+# ------------------------------------------------------------------------
+# Windows: register DNS DoH template (IP -> HTTPS template)
+# ------------------------------------------------------------------------
 function Register-DohTemplate {
     param([string]$ServerIP, [string]$Template)
     if (-not $ServerIP -or -not $Template) { return }
@@ -353,9 +358,9 @@ function Register-DohTemplate {
     }
 }
 
-# -------------------------------
-# Windows: set DoH policy (HKLM policy path)
-# -------------------------------
+# ------------------------------------------------------------------------
+# Windows: set DoH policy (Windows Registry HKLM policy path)
+# ------------------------------------------------------------------------
 function Set-WindowsDohPolicy {
     param([WinDohPolicy]$WinDohPolicy)
 
@@ -371,12 +376,12 @@ function Set-WindowsDohPolicy {
     }
 
     Set-ItemProperty -Path $path -Name "DoHPolicy" -Type DWord -Value $v
-    Write-OK ("Windows DoH policy set to {0} ({1})" -f $WinDohPolicy, $v)
+    Write-OK ("Windows DNS DoH policy set to {0} ({1})" -f $WinDohPolicy, $v)
 }
 
-# -------------------------------
+# ------------------------------------------------------------------------
 # Chrome (per-user HKCU policy)
-# -------------------------------
+# ------------------------------------------------------------------------
 function Set-ChromePolicy {
     param([TriState]$State, [string[]]$Templates)
 
@@ -407,9 +412,9 @@ function Set-ChromePolicy {
     }
 }
 
-# -------------------------------
+# ------------------------------------------------------------------------
 # Firefox (per-user user.js)
-# -------------------------------
+# ------------------------------------------------------------------------
 function Set-FirefoxDoh {
     param([TriState]$State, [string]$PrimaryTemplate, [string]$BootstrapIP)
 
@@ -463,9 +468,9 @@ function Set-FirefoxDoh {
     }
 }
 
-# -------------------------------
+# ------------------------------------------------------------------------
 # BEGIN EXECUTION
-# -------------------------------
+# ------------------------------------------------------------------------
 Write-Headline "=== DNS over HTTPS Configuration (Safe Mode) ==="
 
 # Compute the candidate IPs that we will consider for template registration / checks
@@ -490,9 +495,9 @@ foreach ($ip in $candidateIPs) {
 }
 $knownTemplates = $knownTemplates | Select-Object -Unique
 
-# -------------------------------
+# ------------------------------------------------------------------------
 # Optionally apply adapter DNS (independent of WindowsDoH)
-# -------------------------------
+# ------------------------------------------------------------------------
 if ($ApplyAdapterDNS) {
     try {
         if (-not $PrimaryDNS -and -not $SecondaryDNS) {
@@ -506,9 +511,9 @@ if ($ApplyAdapterDNS) {
     }
 }
 
-# -------------------------------
+# ------------------------------------------------------------------------
 # WINDOWS: DoH configuration (requires Admin)
-# -------------------------------
+# ------------------------------------------------------------------------
 try {
     if ($WindowsDoH -ne [TriState]::Unchanged) {
         $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).
@@ -638,9 +643,9 @@ try {
     $script:HadError = $true
 }
 
-# -------------------------------
+# ------------------------------------------------------------------------
 # CHROME: per-user policy (HKCU)
-# -------------------------------
+# ------------------------------------------------------------------------
 try {
     if ($ChromeDoH -ne [TriState]::Unchanged) {
         # Build templates for Chrome: prefer those associated with candidate IPs (if any)
@@ -653,9 +658,9 @@ try {
     $script:HadError = $true
 }
 
-# -------------------------------
+# ------------------------------------------------------------------------
 # FIREFOX: per-user user.js
-# -------------------------------
+# ------------------------------------------------------------------------
 try {
     if ($FirefoxDoH -ne [TriState]::Unchanged) {
         # Firefox takes a single primary URI + optional bootstrapAddress
@@ -676,9 +681,9 @@ try {
     $script:HadError = $true
 }
 
-# -------------------------------
+# ------------------------------------------------------------------------
 # Summary & final smoke tests
-# -------------------------------
+# ------------------------------------------------------------------------
 Write-Host ""
 Write-Headline "=== Summary ==="
 Write-Info ("Windows:  {0} (Policy: {1})" -f $WindowsDoH, $WindowsPolicy)
