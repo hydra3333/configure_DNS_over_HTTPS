@@ -1,4 +1,4 @@
-# Script to (re)Set DoH (DNS over HTTPS) and DNS IP addresses
+# Script to ReConfigure DoH (DNS over HTTPS) and DNS IP addresses
 
 ![Platform](https://img.shields.io/badge/platform-Windows%2011-lightgrey) ![License](https://img.shields.io/badge/license-AGPL--3.0-green)
 
