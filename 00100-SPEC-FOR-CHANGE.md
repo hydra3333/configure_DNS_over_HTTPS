@@ -1,5 +1,3 @@
----
-
 # DNS over HTTPS (DoH) Configuration Script — Change Specification (PowerShell 5.1)
 
 **Goal:** produce a stable, PowerShell 5.1–compatible script that can safely configure DoH across **Windows 11 (OS resolver)**, **Chrome (HKCU policy)**, and **Firefox (user.js per profile)**, while **never breaking name resolution** and **always proving what worked**.
