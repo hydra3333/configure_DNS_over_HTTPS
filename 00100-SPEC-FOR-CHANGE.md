@@ -79,7 +79,7 @@ Single user meaning, mapped to each product’s native knobs.
 | **Chrome**     | DoH disabled      | Try DoH; may fallback                 | DoH only (set templates)            |
 | **Firefox**    | `mode=5` (OS DNS) | `mode=2` (TRR-first)                  | `mode=3` (TRR-only)                 |
 
-#### 2.5 Exact knobs to set (what the script applies)
+### 2.5 Exact knobs to set (what the script applies)
 
 | Target                                 | (A) **Off**                                                                                  | (B) **Allow / TRR-first / Automatic**                                                                                    | (C) **Require / TRR-only / Secure**                                                                                                                                        |
 | -------------------------------------- | -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
